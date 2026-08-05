@@ -216,13 +216,28 @@ func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) str
 	return strings.Join(parts, "\n")
 }
 
+// sandboxEnvSet reports whether IS_SANDBOX=1 is set either in the session's
+// extra env (from [projects.agent.options.env]) or in cc-connect's own
+// environment (inherited by the spawned CLI). Claude Code allows
+// bypassPermissions under root when this is set, so no downgrade is needed.
+func sandboxEnvSet(extraEnv []string) bool {
+	for _, kv := range extraEnv {
+		if kv == "IS_SANDBOX=1" {
+			return true
+		}
+	}
+	return os.Getenv("IS_SANDBOX") == "1"
+}
+
 func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
-	// Claude Code rejects bypassPermissions when running as root.
-	// Downgrade to "auto" which auto-approves internally in cc-connect.
+	// Claude Code rejects bypassPermissions when running as root — unless
+	// IS_SANDBOX=1 is set, the CLI's escape hatch for containerized root.
+	// Honor IS_SANDBOX from the session env / our own env before downgrading;
+	// otherwise downgrade to "auto" which auto-approves internally in cc-connect.
 	var rootDowngradeWarning string
-	if mode == "bypassPermissions" && os.Geteuid() == 0 {
+	if mode == "bypassPermissions" && os.Geteuid() == 0 && !sandboxEnvSet(extraEnv) {
 		slog.Warn("claudeSession: bypassPermissions not allowed under root, downgrading to auto mode")
 		mode = "auto"
 		rootDowngradeWarning = "⚠️ Running as root: bypassPermissions mode is not supported and has been downgraded to auto. The agent may still pause on high-risk operations."
