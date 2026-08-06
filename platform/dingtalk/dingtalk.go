@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -793,6 +796,51 @@ func (p *Platform) getAccessToken() (string, error) {
 	return p.accessToken, nil
 }
 
+// postJSONWithRetry POSTs body to url, retrying on transient network
+// errors (EOF, connection resets, timeouts). DingTalk endpoints
+// occasionally drop fresh connections, which would otherwise lose the
+// message entirely. Non-transient errors and HTTP status handling are
+// left to the caller.
+func postJSONWithRetry(ctx context.Context, client *http.Client, url string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
+	const attempts = 3
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientNetErr(err) || i == attempts {
+			return nil, err
+		}
+		slog.Warn("dingtalk: transient send error, retrying", "attempt", i, "error", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(i) * time.Second):
+		}
+	}
+	return nil, lastErr
+}
+
+// isTransientNetErr reports network-level failures worth retrying (EOF,
+// connection resets, timeouts) as opposed to permanent errors.
+func isTransientNetErr(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // ReplyWithAt sends a reply with @mention support. Uses text msgtype (not markdown)
 // because only text type supports highlighted/blue @mentions in DingTalk.
 func (p *Platform) ReplyWithAt(ctx context.Context, rctx any, content string, atUsers []string, atAll bool) error {
@@ -819,13 +867,7 @@ func (p *Platform) ReplyWithAt(ctx context.Context, rctx any, content string, at
 		return fmt.Errorf("dingtalk: marshal reply: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rc.sessionWebhook, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("dingtalk: create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := core.HTTPClient.Do(req)
+	resp, err := postJSONWithRetry(ctx, core.HTTPClient, rc.sessionWebhook, body, nil)
 	if err != nil {
 		return fmt.Errorf("dingtalk: send reply: %w", err)
 	}
@@ -867,13 +909,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("dingtalk: marshal reply: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rc.sessionWebhook, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("dingtalk: create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := core.HTTPClient.Do(req)
+	resp, err := postJSONWithRetry(ctx, core.HTTPClient, rc.sessionWebhook, body, nil)
 	if err != nil {
 		return fmt.Errorf("dingtalk: send reply: %w", err)
 	}
@@ -1680,14 +1716,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 		return fmt.Errorf("dingtalk: marshal proactive message: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("dingtalk: create proactive request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-acs-dingtalk-access-token", token)
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := postJSONWithRetry(ctx, p.httpClient, apiURL, body, map[string]string{"x-acs-dingtalk-access-token": token})
 	if err != nil {
 		return fmt.Errorf("dingtalk: proactive send request: %w", err)
 	}
