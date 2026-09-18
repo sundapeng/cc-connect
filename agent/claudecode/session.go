@@ -323,7 +323,15 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	// AgentSystemPromptForLang returns the English default — same bytes as
 	// the pre-PR buildAppendSystemPrompt(core.AgentSystemPrompt(), ...) call.
 	if appended := buildAppendSystemPrompt(core.AgentSystemPromptForLang(lang), platformPrompt, appendSystemPrompt); appended != "" {
-		if platformPrompt == "" && appendSystemPrompt == "" {
+		if be != nil && !be.IsLocal() {
+			// Remote backends cannot see frontend files — an
+			// --append-system-prompt-file path would make the remote claude
+			// exit with "file not found" on every spawn. Pass the prompt
+			// inline instead: the Windows 8192-byte limit that motivated the
+			// file does not apply (SSH targets are Linux, ARG_MAX is ~2MB),
+			// and buildRemoteSSHArgs shell-quotes the content.
+			innerArgs = append(innerArgs, "--append-system-prompt", appended)
+		} else if platformPrompt == "" && appendSystemPrompt == "" {
 			path, err := ensureSharedSystemPromptFile(ccDataDir, appended)
 			if err != nil {
 				cancel()
