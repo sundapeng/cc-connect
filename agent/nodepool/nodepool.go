@@ -282,10 +282,21 @@ func ExpandPath(p string) string {
 //
 //	sh -c 'cd "<workDir>" && exec env VAR=val ... <cmd> <args...>'
 //
+// The inner command is built first and then shell-quoted as ONE argument to
+// sh -c. Nesting must go through shellQuote — a hand-written `sh -c '...'`
+// wrapper would be closed prematurely by the first single quote of any inner
+// value, and the remote login shell would execute a truncated command with
+// the tail as stray arguments (seen live as `env` printing the environment
+// with no command to run).
+//
+// Env vars ride the `env` command — `exec VAR=val cmd` is NOT shell
+// assignment syntax: the shell would try to execute a file literally named
+// "VAR=val" (resolved against the workdir, thanks to URL slashes), the
+// "No such file or directory" failure from the first live run.
+//
 // No PTY is allocated: stdio JSON is line-oriented and a PTY would inject
-// terminal escapes. stdin/stdout/stderr are piped by cc-connect and forwarded
-// transparently by ssh. BatchMode fails fast on a missing key instead of
-// hanging on a password prompt.
+// terminal escapes. BatchMode fails fast on a missing key instead of hanging
+// on a password prompt.
 func BuildRemoteSSHArgs(be *Backend, cliBin string, allArgs []string, extraEnv []string) []string {
 	args := []string{"-q", "-o", "BatchMode=yes"}
 	if be.Port != 0 && be.Port != 22 {
@@ -297,29 +308,32 @@ func BuildRemoteSSHArgs(be *Backend, cliBin string, allArgs []string, extraEnv [
 	args = append(args, be.SSHOpts...)
 	args = append(args, be.Host, "--")
 
-	// Build the remote shell command. We exec the agent binary so it replaces
-	// the shell (clean process-group kill when ssh closes the connection).
-	var sb strings.Builder
-	sb.WriteString("sh -c '")
+	// Build the inner command. We exec the agent binary so it replaces the
+	// shell (clean process-group kill when ssh closes the connection).
+	var inner strings.Builder
 	if be.WorkDir != "" {
-		sb.WriteString("cd \"")
-		sb.WriteString(strings.ReplaceAll(be.WorkDir, "\"", "\\\""))
-		sb.WriteString("\" && ")
+		inner.WriteString("cd \"")
+		inner.WriteString(strings.ReplaceAll(be.WorkDir, "\"", "\\\""))
+		inner.WriteString("\" && ")
 	}
-	sb.WriteString("exec")
+	inner.WriteString("exec")
+	if len(extraEnv) > 0 {
+		inner.WriteString(" env")
+	}
 	for _, e := range extraEnv {
-		// env VAR=val tokens; quote the value for the remote shell.
-		sb.WriteString(" ")
-		sb.WriteString(shellQuoteEnv(e))
+		inner.WriteString(" ")
+		inner.WriteString(shellQuoteEnv(e))
 	}
-	sb.WriteString(" ")
-	sb.WriteString(shellQuote(cliBin))
+	inner.WriteString(" ")
+	inner.WriteString(shellQuote(cliBin))
 	for _, a := range allArgs {
-		sb.WriteString(" ")
-		sb.WriteString(shellQuote(a))
+		inner.WriteString(" ")
+		inner.WriteString(shellQuote(a))
 	}
-	sb.WriteString("'")
-	args = append(args, sb.String())
+
+	// The remote login shell (zsh, bash, ...) parses the ssh command line
+	// first; sh -c must receive the whole inner command as ONE argument.
+	args = append(args, "sh", "-c", shellQuote(inner.String()))
 	return args
 }
 

@@ -1,6 +1,8 @@
 package nodepool
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -202,12 +204,12 @@ func TestBuildRemoteSSHArgs(t *testing.T) {
 	}
 	args := BuildRemoteSSHArgs(be, "claude", []string{"--model", "glm-5.2"}, []string{"ANTHROPIC_BASE_URL=http://x:15443", "FOO=bar baz"})
 	joined := strings.Join(args, " ")
-	// Must use BatchMode, the port, the expanded key, and exec.
+	// Must use BatchMode, the port, the expanded key, exec env, and quoted vars.
 	checks := []string{
 		"-q", "-o", "BatchMode=yes", "-p", "2024",
 		"-i", strings.ReplaceAll("~/.ssh/id_rsa", "~", ""), // expanded
 		"admin@localhost", "--",
-		"sh -c", "cd \"/home/admin/ws\"", "exec",
+		"sh -c", "cd \"/home/admin/ws\"", "exec env",
 		"ANTHROPIC_BASE_URL='http://x:15443'",
 		"FOO='bar baz'",
 		"'claude'", "--model", "glm-5.2",
@@ -216,6 +218,47 @@ func TestBuildRemoteSSHArgs(t *testing.T) {
 		if !strings.Contains(joined, c) {
 			t.Errorf("expected SSH args to contain %q; got: %s", c, joined)
 		}
+	}
+	// No env vars → no `env` prefix (exec straight to the binary).
+	joined = strings.Join(BuildRemoteSSHArgs(be, "claude", []string{"-p"}, nil), " ")
+	if strings.Contains(joined, "exec env") {
+		t.Errorf("no extraEnv must not inject an env command: %s", joined)
+	}
+	if !strings.Contains(joined, "exec 'claude'") {
+		t.Errorf("expected direct exec of the binary: %s", joined)
+	}
+}
+
+// TestBuildRemoteSSHArgsLive runs the REAL generated argv over ssh against a
+// live backend (guarded: set MAOMAO_E2E=1 and MAOMAO_E2E_PORT). It exists so
+// a bug like the missing `env` command — where the remote shell executed
+// "NOELLE_BASE_URL=https://..." as a file path — cannot pass review again:
+// the command under test is byte-for-byte what cc-connect spawns.
+func TestBuildRemoteSSHArgsLive(t *testing.T) {
+	port := os.Getenv("MAOMAO_E2E_PORT")
+	if os.Getenv("MAOMAO_E2E") == "" || port == "" {
+		t.Skip("set MAOMAO_E2E=1 and MAOMAO_E2E_PORT to run")
+	}
+	be := &Backend{
+		Name:    "live",
+		Host:    "admin@localhost",
+		Port:    2024,
+		SSHKey:  os.Getenv("MAOMAO_E2E_KEY"),
+		SSHOpts: []string{"-o", "UserKnownHostsFile=" + os.Getenv("MAOMAO_E2E_KH")},
+		WorkDir: os.Getenv("MAOMAO_E2E_WORKDIR"),
+	}
+	// Env values with URL slashes and spaces — the exact shapes that explode
+	// when the `env` command is missing.
+	sshArgs := BuildRemoteSSHArgs(be, os.Getenv("MAOMAO_E2E_BIN"), []string{"exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-"},
+		[]string{"NOELLE_BASE_URL=https://dlf-noelle.aliyun-inc.com", "FOO=bar baz"})
+	cmd := exec.Command("ssh", sshArgs...)
+	cmd.Stdin = strings.NewReader("Reply with exactly: OK")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ssh run failed: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(string(out), "OK") {
+		t.Fatalf("expected OK in output, got: %s", out)
 	}
 }
 

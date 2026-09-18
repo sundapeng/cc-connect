@@ -40,16 +40,19 @@ func TestSpawnRemoteArgQuoting(t *testing.T) {
 	}
 	sshArgs := nodepool.BuildRemoteSSHArgs(be, "codex", args, []string{"CODEX_API_KEY=QTlmb2s="})
 	joined := strings.Join(sshArgs, " ")
+	// With proper quote nesting each inner element appears as '\''...'\''.
 	for _, frag := range []string{
-		"cd \"/home/admin/ws\"", "CODEX_API_KEY='QTlmb2s='",
-		"'-c'", `model_reasoning_effort="ultra"`, "'--json'",
+		"cd \"/home/admin/ws\"", "exec env", "CODEX_API_KEY=",
+		`model_reasoning_effort="ultra"`, "--json",
 	} {
 		if !strings.Contains(joined, frag) {
 			t.Errorf("expected %q to survive SSH quoting, got: %s", frag, joined)
 		}
 	}
-	if strings.Count(joined, "sh -c '") != 1 {
-		t.Errorf("expected exactly one sh -c command, got: %s", joined)
+	// Exactly one sh -c, and the whole inner command is its single argument
+	// (the tail of the string closes the wrapper quote).
+	if strings.Count(joined, "sh -c ") != 1 || !strings.HasSuffix(joined, "'") {
+		t.Errorf("expected one sh -c wrapping the whole command, got: %s", joined)
 	}
 }
 
