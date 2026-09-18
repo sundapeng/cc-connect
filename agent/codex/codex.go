@@ -534,9 +534,14 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	// Multi-node pool: bind this session to a backend (affinity for resumed
 	// thread ids, round-robin for fresh ones). nil preserves local spawn.
+	// A remote backend's cmd (wrapper/binary path) replaces the local one —
+	// remote PATH does not carry the frontend's installs.
 	var be *nodepool.Backend
 	if a.pool != nil {
 		be, _ = a.pool.SelectBackend(sessionID)
+		if be != nil && be.Cmd != "" {
+			cliBin = be.Cmd
+		}
 	}
 	// CODEX_HOME points the subprocess at a local config dir; it is
 	// meaningless on a remote backend, which uses its own ~/.codex.

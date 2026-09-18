@@ -165,9 +165,17 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 		args = append(append([]string{}, cs.cliExtraArgs...), args...)
 	}
 
-	bin := cs.cmd
-	if bin == "" {
-		bin = "codex"
+	// binFor resolves the binary for the CURRENT backend: a remote backend's
+	// cmd (wrapper path) replaces the agent-level one, and failover switches
+	// backends mid-Send, so this must be re-evaluated per attempt.
+	binFor := func() string {
+		if cs.backend != nil && cs.backend.Cmd != "" {
+			return cs.backend.Cmd
+		}
+		if cs.cmd != "" {
+			return cs.cmd
+		}
+		return "codex"
 	}
 
 	// Attachments are staged under the local work_dir; a remote backend
@@ -189,7 +197,7 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 	}
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		cmd, stdout, stderrBuf, err := cs.spawn(bin, args, prompt)
+		cmd, stdout, stderrBuf, err := cs.spawn(binFor(), args, prompt)
 		if err == nil {
 			if cs.pool != nil {
 				cs.pool.MarkUp(cs.backend)
