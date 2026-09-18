@@ -80,6 +80,12 @@ type Agent struct {
 	// means legacy spawn as the supervisor user. See core/runas.go.
 	spawnOpts core.SpawnOptions
 
+	// pool holds the optional multi-node backend list. nil preserves the
+	// legacy single-local-process behavior. When non-nil, each StartSession
+	// selects a backend (affinity/round-robin/failover) and spawns claude
+	// locally or over SSH accordingly.
+	pool *pool
+
 	mu sync.RWMutex
 }
 
@@ -266,6 +272,19 @@ func New(opts map[string]any) (core.Agent, error) {
 		slog.Warn("claudecode: failed to write shared system prompt file at startup; will retry on first spawn", "err", err, "cc_data_dir", ccDataDir)
 	}
 
+	// Multi-node pool: optional [[projects.agent.options.hosts]] array. When
+	// present, StartSession selects a backend (local or SSH-reached) per
+	// session. nil preserves the legacy single-local-process behavior.
+	backends, err := parseBackends(opts, workDir, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var p *pool
+	if len(backends) > 0 {
+		p = &pool{backends: backends}
+		slog.Info("claudecode: multi-node pool enabled", "backends", len(backends))
+	}
+
 	return &Agent{
 		workDir:          workDir,
 		cmd:              cmd,
@@ -288,6 +307,7 @@ func New(opts map[string]any) (core.Agent, error) {
 
 		appendSystemPrompt: appendSystemPrompt,
 		lang:               lang,
+		pool:               p,
 	}, nil
 }
 
@@ -551,9 +571,28 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	// When router_url is set, --verbose conflicts with --output-format stream-json
 	// (verbose emits non-JSON text to stdout that corrupts the JSON stream).
 	disableVerbose := a.routerURL != ""
+
+	// Multi-node pool: select a backend for this session. When no pool is
+	// configured, be is nil and newClaudeSession takes the legacy local path.
+	var be *backend
+	if a.pool != nil {
+		be, _ = a.pool.selectBackend(sessionID)
+	}
+	// Resolve the effective workDir/cmd for the chosen backend (a remote
+	// backend may override both). nil backend = agent defaults.
+	effectiveWorkDir := workDir
+	effectiveCmd := a.cmd
+	if be != nil {
+		if be.workDir != "" {
+			effectiveWorkDir = be.workDir
+		}
+		if be.cmd != "" {
+			effectiveCmd = be.cmd
+		}
+	}
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)
+	return newClaudeSession(ctx, effectiveWorkDir, effectiveCmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, be, a.pool)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {

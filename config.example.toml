@@ -870,6 +870,42 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # ANTHROPIC_DEFAULT_SONNET_MODEL = "K2.6"
 # ANTHROPIC_DEFAULT_OPUS_MODEL = "K2.6"
 
+# Multi-Node Pool (optional) / 多节点池（可选）
+# Route Claude Code execution across multiple backend servers. Each backend
+# runs its own claude process; a cc-connect session binds to one backend
+# (session affinity) so --resume finds the session file on that box. New
+# sessions are distributed round-robin; if a backend is down, the session
+# fails over to another (fresh session, context from the dead box is lost).
+# Omit the hosts array entirely for the default single-local-process behavior.
+# 跨多台后端服务器路由 Claude Code 执行。每个后端运行各自的 claude 进程；
+# 一个会话绑定到一台后端（会话亲和），--resume 会找到该机器上的会话文件。
+# 新会话轮询分配；后端宕机时故障转移到另一台（全新会话，丢失原上下文）。
+#
+# [[projects.agent.options.hosts]]
+# name = "local"               # reference name for /node
+# host = ""                    # "" = local exec (no SSH); the local backend
+# work_dir = "/root/ws"        # working directory (defaults to work_dir above)
+# cmd = "claude"               # claude binary (defaults to the agent-level cmd)
+#
+# [[projects.agent.options.hosts]]
+# name = "sandbox-2024"
+# host = "admin@10.0.0.4"      # SSH host (user@host); reached over SSH
+# port = 2024                  # SSH port (default 22)
+# ssh_key = "~/.ssh/id_rsa"    # SSH identity (default ~/.ssh/id_rsa)
+# work_dir = "/home/admin/ws"  # working directory on the remote box
+# cmd = "claude"               # remote claude binary (must be in remote PATH)
+# ssh_opts = ["-o", "StrictHostKeyChecking=no"]  # extra ssh flags (optional)
+#
+# Requirements for remote backends:
+#   - Passwordless SSH key auth from the cc-connect host (BatchMode=yes).
+#   - claude installed and in PATH (or set cmd to its full path).
+#   - Env vars (ANTHROPIC_* etc.) from [projects.agent.options.env] are
+#     injected via the remote `env` command (SSH does not forward local env).
+# 远程后端要求：
+#   - 从 cc-connect 主机到后端的免密 SSH 密钥认证（BatchMode=yes）。
+#   - 已安装 claude 且在 PATH 中（或用 cmd 指定完整路径）。
+#   - [projects.agent.options.env] 的环境变量通过远程 `env` 命令注入。
+
 # Claude Code Router Integration / Claude Code Router 集成
 # Route Claude Code requests through Claude Code Router to use different model providers.
 # 通过 Claude Code Router 路由 Claude Code 请求，使用不同的模型提供商。

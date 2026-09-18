@@ -229,7 +229,7 @@ func sandboxEnvSet(extraEnv []string) bool {
 	return os.Getenv("IS_SANDBOX") == "1"
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language, be *backend, p *pool) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root — unless
@@ -385,8 +385,20 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	// spawn. WorkDir tells BuildSpawnCommand to wrap the command with a chdir;
 	// the path itself is passed through RunAsChdirEnv below.
 	spawnOpts.WorkDir = workDir
-	cmd := core.BuildSpawnCommand(sessionCtx, spawnOpts, cliBin, allArgs...)
-	cmd.Dir = workDir
+	var cmd *exec.Cmd
+	if be != nil && !be.isLocal() {
+		// Remote backend: spawn claude over SSH. No cmd.Dir (cd happens in
+		// the remote shell); env is injected via the remote `env` command
+		// because ssh does not forward the local environment.
+		sshArgs := buildRemoteSSHArgs(be, cliBin, allArgs, extraEnv)
+		cmd = exec.CommandContext(sessionCtx, "ssh", sshArgs...)
+		slog.Info("claudeSession: spawning on remote backend",
+			"backend", be.name, "host", be.host, "workDir", be.workDir)
+	} else {
+		// Local backend (or no pool): legacy spawn path.
+		cmd = core.BuildSpawnCommand(sessionCtx, spawnOpts, cliBin, allArgs...)
+		cmd.Dir = workDir
+	}
 	// Put the child into its own process group so Close() can terminate the
 	// entire descendant tree (claude CLI → MCP server bridges → ...) with a
 	// single signal. Without this, killing only the direct child can leave
@@ -419,7 +431,12 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	// enforces this, but filtering here makes the cc-connect spawn argv
 	// the single source of truth.
 	env = core.FilterEnvForSpawn(env, spawnOpts)
-	cmd.Env = env
+	// For remote backends the env is already embedded in the remote shell
+	// command (buildRemoteSSHArgs); setting cmd.Env would be ignored by ssh
+	// anyway, so only set it for local spawns.
+	if be == nil || be.isLocal() {
+		cmd.Env = env
+	}
 
 	var providerEnvSnapshot []string
 	for _, e := range env {

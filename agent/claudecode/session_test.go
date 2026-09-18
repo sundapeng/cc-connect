@@ -956,6 +956,8 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 		0,  // maxContextTokens
 		"", // ccDataDir (lets ensureSharedSystemPromptFile fall back to TempDir)
 		"", // lang
+		nil, // backend (local, no pool)
+		nil, // pool
 	)
 	if err != nil {
 		t.Fatalf("newClaudeSession: %v", err)

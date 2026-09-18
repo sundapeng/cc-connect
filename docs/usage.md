@@ -991,6 +991,63 @@ type = "claudecode"
 
 ---
 
+## Multi-Node Pool Mode
+
+Route Claude Code execution across multiple backend servers from a single bot.
+
+When `[[projects.agent.options.hosts]]` is configured, the bot operates as a
+**session-affinity pool**: each conversation binds to one backend (chosen by
+round-robin or `/node`), and `claude` is spawned on that backend — locally or
+over SSH. Because Claude Code stores session state per-machine
+(`~/.claude/projects`), a session stays on its bound backend so `--resume`
+works; if that backend dies, the session fails over to another (fresh, context
+lost).
+
+### Configure
+
+```toml
+[[projects]]
+name = "my-pool"
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+model = "glm-5.2"
+
+[[projects.agent.options.hosts]]
+name     = "local"
+host     = ""                 # local exec, no SSH
+work_dir = "/root/ws"
+
+[[projects.agent.options.hosts]]
+name     = "sandbox-2024"
+host     = "admin@10.0.0.4"
+port     = 2024
+work_dir = "/home/admin/ws"
+```
+
+### How it works
+
+- **Selection order**: pending `/node <name>` → existing binding (affinity) →
+  round-robin across healthy backends.
+- **Remote spawn**: `ssh -q -o BatchMode=yes [-p port] host -- sh -c 'cd
+  "<work_dir>" && exec env VAR=val ... claude <args>'`. No PTY (stream-json is
+  line-oriented); env from `[projects.agent.options.env]` is injected via the
+  remote `env` command since SSH does not forward the local environment.
+- **Failover**: if a backend's SSH dial or claude spawn fails, it is marked
+  down and the session restarts on another healthy backend (no `--resume` —
+  the old session file lives on the dead box).
+
+### Requirements for remote backends
+
+- Passwordless SSH key auth from the cc-connect host (`BatchMode=yes`).
+- `claude` installed and in PATH (or set `cmd` per-host).
+- The env vars the bot needs (`ANTHROPIC_*` etc.) are forwarded automatically
+  from `[projects.agent.options.env]`.
+
+---
+
 ## Web Admin Dashboard (Beta)
 
 > **Status: Beta.** This feature is available since v1.2.2-beta.5. The UI and API may change in future releases.
