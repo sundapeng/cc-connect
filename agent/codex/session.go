@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chenhg5/cc-connect/agent/nodepool"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -43,6 +44,13 @@ type codexSession struct {
 	closeOnce      sync.Once
 	cmdMu          sync.Mutex
 	cmds           map[*exec.Cmd]struct{}
+
+	// backend/pool record which pool backend (if any) this session spawns
+	// on. Remote backends run `codex exec` over SSH; the rollout files for
+	// resume live on that backend, so every thread id learned from the
+	// output is chain-registered to it (see trackThreadID).
+	backend *nodepool.Backend
+	pool    *nodepool.Pool
 
 	pendingMsgs []string // buffered agent_message texts awaiting classification
 
@@ -87,7 +95,7 @@ func prependCodexPromptPreamble(prompt string, preamble string) string {
 	return "Before answering, follow these project-level instructions for this cc-connect session. They are not user content.\n\n" + preamble + "\n\n---\n\nUser message:\n" + prompt
 }
 
-func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, workDir, model, effort, mode, resumeID, baseURL string, extraEnv []string, modelProvider string, systemPrompt string, appendPrompt string) (*codexSession, error) {
+func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, workDir, model, effort, mode, resumeID, baseURL string, extraEnv []string, modelProvider string, systemPrompt string, appendPrompt string, be *nodepool.Backend, p *nodepool.Pool) (*codexSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	cs := &codexSession{
@@ -105,14 +113,30 @@ func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, 
 		ctx:            sessionCtx,
 		cancel:         cancel,
 		cmds:           make(map[*exec.Cmd]struct{}),
+		backend:        be,
+		pool:           p,
 	}
 	cs.alive.Store(true)
 
 	if resumeID != "" && resumeID != core.ContinueSession {
-		cs.threadID.Store(resumeID)
+		cs.trackThreadID(resumeID)
 	}
 
 	return cs, nil
+}
+
+// trackThreadID records a thread id locally and, in a node pool, binds it to
+// the backend this session spawns on: the engine passes exactly this id to
+// the next StartSession, and resume only works on the machine that holds the
+// rollout files.
+func (cs *codexSession) trackThreadID(tid string) {
+	if tid == "" {
+		return
+	}
+	cs.threadID.Store(tid)
+	if cs.pool != nil {
+		cs.pool.RegisterSessionChain(tid, cs.backend)
+	}
 }
 
 // Send launches a codex subprocess.
@@ -146,33 +170,102 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 		bin = "codex"
 	}
 
+	// Attachments are staged under the local work_dir; a remote backend
+	// cannot read them. Warn instead of failing — text turns work fine.
+	if cs.backend != nil && !cs.backend.IsLocal() && len(imagePaths) > 0 {
+		slog.Warn("codexSession: images staged locally are not visible on the remote backend; the turn may fail",
+			"backend", cs.backend.Name, "count", len(imagePaths))
+	}
+
 	slog.Debug("codexSession: launching", "resume", isResume, "args", core.RedactArgs(args))
 
-	cmd := exec.CommandContext(cs.ctx, bin, args...)
-	cmd.Dir = cs.workDir
+	// Pool failover: a failed spawn (SSH down, backend unreachable) marks the
+	// backend down and retries on the next healthy one. The retry drops
+	// resume — the rollout files for this thread live on the failed backend
+	// — and prepends the preamble again since the turn restarts fresh.
+	attempts := 1
+	if cs.pool != nil && cs.backend != nil && !cs.backend.IsLocal() {
+		attempts = len(cs.pool.Backends)
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		cmd, stdout, stderrBuf, err := cs.spawn(bin, args, prompt)
+		if err == nil {
+			if cs.pool != nil {
+				cs.pool.MarkUp(cs.backend)
+			}
+			cs.wg.Add(1)
+			go cs.readLoop(cmd, stdout, stderrBuf)
+			return nil
+		}
+		lastErr = err
+		if cs.pool == nil || cs.backend == nil || cs.backend.IsLocal() {
+			return err
+		}
+		slog.Warn("codexSession: backend spawn failed, failing over",
+			"backend", cs.backend.Name, "attempt", attempt+1, "err", err)
+		cs.pool.MarkDown(cs.backend)
+		next, _ := cs.pool.SelectBackend("")
+		if next == nil || next == cs.backend {
+			break
+		}
+		cs.backend = next
+		if isResume {
+			// Fresh conversation on the new backend: no resume, and the
+			// preamble must be re-prepended like any fresh turn.
+			cs.threadID.Store("")
+			prompt = prependCodexPromptPreamble(prompt, cs.promptPreamble)
+			args = cs.buildExecArgs(prompt, nil)
+			if len(cs.cliExtraArgs) > 0 {
+				args = append(append([]string{}, cs.cliExtraArgs...), args...)
+			}
+			isResume = false
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("codexSession: start: %w", lastErr)
+	}
+	return nil
+}
+
+// spawn builds and starts one codex process — locally, or over SSH when the
+// session is bound to a remote pool backend. The returned cmd is started and
+// registered for cleanup; stdout/stderr are piped for the read loop.
+func (cs *codexSession) spawn(bin string, args []string, prompt string) (*exec.Cmd, io.ReadCloser, *bytes.Buffer, error) {
+	var cmd *exec.Cmd
+	if cs.backend != nil && !cs.backend.IsLocal() {
+		sshArgs := nodepool.BuildRemoteSSHArgs(cs.backend, bin, args, cs.extraEnv)
+		cmd = exec.CommandContext(cs.ctx, "ssh", sshArgs...)
+		slog.Info("codexSession: spawning on remote backend",
+			"backend", cs.backend.Name, "host", cs.backend.Host, "workDir", cs.backend.WorkDir)
+	} else {
+		cmd = exec.CommandContext(cs.ctx, bin, args...)
+		cmd.Dir = cs.workDir
+		if cs.backend != nil && cs.backend.WorkDir != "" {
+			cmd.Dir = cs.backend.WorkDir
+		}
+	}
 	prepareCmdForKill(cmd)
-	if len(cs.extraEnv) > 0 {
-		cmd.Env = core.MergeEnv(os.Environ(), cs.extraEnv)
+	if cs.backend == nil || cs.backend.IsLocal() {
+		if len(cs.extraEnv) > 0 {
+			cmd.Env = core.MergeEnv(os.Environ(), cs.extraEnv)
+		}
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("codexSession: stdout pipe: %w", err)
+		return nil, nil, nil, fmt.Errorf("codexSession: stdout pipe: %w", err)
 	}
 
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("codexSession: start: %w", err)
+		return nil, nil, nil, fmt.Errorf("codexSession: start: %w", err)
 	}
 	cs.addCmd(cmd)
-
-	cs.wg.Add(1)
-	go cs.readLoop(cmd, stdout, &stderrBuf)
-
-	return nil
+	return cmd, stdout, &stderrBuf, nil
 }
 
 func (cs *codexSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
@@ -375,7 +468,7 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 	switch eventType {
 	case "thread.started":
 		if tid, ok := raw["thread_id"].(string); ok {
-			cs.threadID.Store(tid)
+			cs.trackThreadID(tid)
 			cs.contextMu.Lock()
 			cs.sessionFile = ""
 			cs.contextUsage = nil

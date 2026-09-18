@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/agent/internal/skillroots"
+	"github.com/chenhg5/cc-connect/agent/nodepool"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -84,7 +85,7 @@ type Agent struct {
 	// legacy single-local-process behavior. When non-nil, each StartSession
 	// selects a backend (affinity/round-robin/failover) and spawns claude
 	// locally or over SSH accordingly.
-	pool *pool
+	pool *nodepool.Pool
 
 	mu sync.RWMutex
 }
@@ -275,13 +276,13 @@ func New(opts map[string]any) (core.Agent, error) {
 	// Multi-node pool: optional [[projects.agent.options.hosts]] array. When
 	// present, StartSession selects a backend (local or SSH-reached) per
 	// session. nil preserves the legacy single-local-process behavior.
-	backends, err := parseBackends(opts, workDir, cmd)
+	backends, err := nodepool.ParseBackends(opts, workDir, cmd)
 	if err != nil {
 		return nil, err
 	}
-	var p *pool
+	var p *nodepool.Pool
 	if len(backends) > 0 {
-		p = &pool{backends: backends}
+		p = &nodepool.Pool{Backends: backends}
 		slog.Info("claudecode: multi-node pool enabled", "backends", len(backends))
 	}
 
@@ -397,13 +398,13 @@ func (a *Agent) ListNodes() []core.NodeInfo {
 	if a.pool == nil {
 		return nil
 	}
-	out := make([]core.NodeInfo, 0, len(a.pool.backends))
-	for _, be := range a.pool.backends {
+	out := make([]core.NodeInfo, 0, len(a.pool.Backends))
+	for _, be := range a.pool.Backends {
 		out = append(out, core.NodeInfo{
-			Name:    be.name,
-			Host:    be.host,
-			WorkDir: be.workDir,
-			Up:      be.up.Load(),
+			Name:    be.Name,
+			Host:    be.Host,
+			WorkDir: be.WorkDir,
+			Up:      be.Up.Load(),
 		})
 	}
 	return out
@@ -414,8 +415,8 @@ func (a *Agent) BoundNode(sessionID string) string {
 	if a.pool == nil {
 		return ""
 	}
-	if be := a.pool.bound(sessionID); be != nil {
-		return be.name
+	if be := a.pool.Bound(sessionID); be != nil {
+		return be.Name
 	}
 	return ""
 }
@@ -426,9 +427,9 @@ func (a *Agent) SelectNode(sessionID, name string) error {
 	if a.pool == nil {
 		return fmt.Errorf("claudecode: no multi-node pool configured")
 	}
-	for _, be := range a.pool.backends {
-		if be.name == name {
-			a.pool.setPendingNode(sessionID, name)
+	for _, be := range a.pool.Backends {
+		if be.Name == name {
+			a.pool.SetPendingNode(sessionID, name)
 			return nil
 		}
 	}
@@ -618,22 +619,22 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 
 	// Multi-node pool: select a backend for this session. When no pool is
 	// configured, be is nil and newClaudeSession takes the legacy local path.
-	var be *backend
+	var be *nodepool.Backend
 	if a.pool != nil {
-		be, _ = a.pool.selectBackend(sessionID)
+		be, _ = a.pool.SelectBackend(sessionID)
 	}
 	a.mu.Unlock()
 
 	// Resolve the effective workDir/cmd for the chosen backend (a remote
 	// backend may override both). nil backend = agent defaults.
-	resolve := func(be *backend) (string, string) {
+	resolve := func(be *nodepool.Backend) (string, string) {
 		wd, c := workDir, a.cmd
 		if be != nil {
-			if be.workDir != "" {
-				wd = be.workDir
+			if be.WorkDir != "" {
+				wd = be.WorkDir
 			}
-			if be.cmd != "" {
-				c = be.cmd
+			if be.Cmd != "" {
+				c = be.Cmd
 			}
 		}
 		return wd, c
@@ -649,21 +650,21 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	// and retry on another healthy backend (failover, fresh session — no
 	// --resume since the dead box holds the session file).
 	var lastErr error
-	for attempt := 0; attempt < len(a.pool.backends); attempt++ {
+	for attempt := 0; attempt < len(a.pool.Backends); attempt++ {
 		wd, c := resolve(be)
 		cs, err := newClaudeSession(ctx, wd, c, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, be, a.pool)
 		if err == nil {
-			a.pool.markUp(be)
+			a.pool.MarkUp(be)
 			return cs, nil
 		}
 		lastErr = err
 		slog.Warn("claudecode: backend spawn failed, failing over",
-			"backend", be.name, "attempt", attempt+1, "err", err)
-		a.pool.markDown(be)
-		a.pool.clearBinding(sessionID)
+			"backend", be.Name, "attempt", attempt+1, "err", err)
+		a.pool.MarkDown(be)
+		a.pool.ClearBinding(sessionID)
 		// Pick the next healthy backend. If none is healthy, selectBackend
 		// returns the first (will surface the error).
-		be, _ = a.pool.selectBackend(sessionID)
+		be, _ = a.pool.SelectBackend(sessionID)
 		if be == nil {
 			break
 		}

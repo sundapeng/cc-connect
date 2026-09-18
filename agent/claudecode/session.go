@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chenhg5/cc-connect/agent/nodepool"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -42,6 +43,13 @@ type claudeSession struct {
 	cancel          context.CancelFunc
 	done            chan struct{}
 	alive           atomic.Bool
+
+	// backend/pool record which pool backend (if any) this session spawned
+	// on, so trackSessionID can bind every forked session id to it — the id
+	// the engine passes to the next StartSession is the one reported here,
+	// and affinity must follow the machine that holds the transcript.
+	backend *nodepool.Backend
+	pool    *nodepool.Pool
 
 	// activeModel stores the model id reported by the CLI's init event (e.g.
 	// "claude-opus-4-7[1m]"). It may be empty if the init event hasn't
@@ -229,7 +237,7 @@ func sandboxEnvSet(extraEnv []string) bool {
 	return os.Getenv("IS_SANDBOX") == "1"
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language, be *backend, p *pool) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language, be *nodepool.Backend, p *nodepool.Pool) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root — unless
@@ -386,14 +394,14 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	// the path itself is passed through RunAsChdirEnv below.
 	spawnOpts.WorkDir = workDir
 	var cmd *exec.Cmd
-	if be != nil && !be.isLocal() {
+	if be != nil && !be.IsLocal() {
 		// Remote backend: spawn claude over SSH. No cmd.Dir (cd happens in
 		// the remote shell); env is injected via the remote `env` command
 		// because ssh does not forward the local environment.
-		sshArgs := buildRemoteSSHArgs(be, cliBin, allArgs, extraEnv)
+		sshArgs := nodepool.BuildRemoteSSHArgs(be, cliBin, allArgs, extraEnv)
 		cmd = exec.CommandContext(sessionCtx, "ssh", sshArgs...)
 		slog.Info("claudeSession: spawning on remote backend",
-			"backend", be.name, "host", be.host, "workDir", be.workDir)
+			"backend", be.Name, "host", be.Host, "workDir", be.WorkDir)
 	} else {
 		// Local backend (or no pool): legacy spawn path.
 		cmd = core.BuildSpawnCommand(sessionCtx, spawnOpts, cliBin, allArgs...)
@@ -434,7 +442,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	// For remote backends the env is already embedded in the remote shell
 	// command (buildRemoteSSHArgs); setting cmd.Env would be ignored by ssh
 	// anyway, so only set it for local spawns.
-	if be == nil || be.isLocal() {
+	if be == nil || be.IsLocal() {
 		cmd.Env = env
 	}
 
@@ -522,9 +530,11 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		ccHooks:             newCCPermissionHookRunner(workDir),
 		startupWarning:      rootDowngradeWarning,
 		promptFilePath:      cleanupPromptPath,
+		backend:             be,
+		pool:                p,
 	}
 	cs.setPermissionMode(mode)
-	cs.sessionID.Store(sessionID)
+	cs.trackSessionID(sessionID)
 	cs.alive.Store(true)
 
 	go cs.readLoop(stdout, &stderrBuf)
@@ -864,7 +874,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		content = result
 	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
-		cs.sessionID.Store(sid)
+		cs.trackSessionID(sid)
 	}
 
 	// Compaction events arrive as `type:"result"` with `subtype:"compact"`
@@ -1164,6 +1174,21 @@ func (cs *claudeSession) Events() <-chan core.Event {
 func (cs *claudeSession) CurrentSessionID() string {
 	v, _ := cs.sessionID.Load().(string)
 	return v
+}
+
+// trackSessionID records a session id locally and, when running in a node
+// pool, binds that id to the backend this process spawned on. Claude Code
+// forks a new session id on every --resume, so each id reported by the
+// running process must be registered or the next turn's StartSession would
+// round-robin onto a backend that has never seen the transcript.
+func (cs *claudeSession) trackSessionID(sid string) {
+	if sid == "" {
+		return
+	}
+	cs.sessionID.Store(sid)
+	if cs.pool != nil {
+		cs.pool.RegisterSessionChain(sid, cs.backend)
+	}
 }
 
 func (cs *claudeSession) permissionModeValue() string {

@@ -16,6 +16,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/chenhg5/cc-connect/agent/internal/skillroots"
+	"github.com/chenhg5/cc-connect/agent/nodepool"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -50,6 +51,12 @@ type Agent struct {
 	configEnv       []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
 	sessionEnv      []string
 	mu              sync.RWMutex
+
+	// pool holds the optional multi-node backend list ([projects.agent.
+	// options.hosts]). nil preserves the legacy single-local-process
+	// behavior; each session binds to one backend (the exec subprocess runs
+	// locally or over SSH) and new sessions round-robin across backends.
+	pool *nodepool.Pool
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -92,6 +99,22 @@ func New(opts map[string]any) (core.Agent, error) {
 		}
 	}
 
+	// Multi-node pool: optional [[projects.agent.options.hosts]] array. Only
+	// the exec backend supports remote spawn for now (app_server keeps a
+	// persistent local JSON-RPC process).
+	backends, err := nodepool.ParseBackends(opts, workDir, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var p *nodepool.Pool
+	if len(backends) > 0 {
+		if backend == "app_server" {
+			return nil, fmt.Errorf("codex: hosts pool requires the exec backend (app_server remote spawn is not supported)")
+		}
+		p = &nodepool.Pool{Backends: backends}
+		slog.Info("codex: multi-node pool enabled", "backends", len(backends))
+	}
+
 	return &Agent{
 		workDir:         workDir,
 		model:           model,
@@ -106,6 +129,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		cliExtraArgs:    cliExtraArgs,
 		configEnv:       configEnv,
 		activeIdx:       -1,
+		pool:            p,
 	}, nil
 }
 
@@ -508,11 +532,63 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	if backend == "app_server" {
 		return newAppServerSession(ctx, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
 	}
-	if codexHome != "" {
+	// Multi-node pool: bind this session to a backend (affinity for resumed
+	// thread ids, round-robin for fresh ones). nil preserves local spawn.
+	var be *nodepool.Backend
+	if a.pool != nil {
+		be, _ = a.pool.SelectBackend(sessionID)
+	}
+	// CODEX_HOME points the subprocess at a local config dir; it is
+	// meaningless on a remote backend, which uses its own ~/.codex.
+	if codexHome != "" && (be == nil || be.IsLocal()) {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
 	}
 
-	return newCodexSession(ctx, cliBin, cliExtraArgs, workDir, model, reasoningEffort, mode, sessionID, baseURL, extraEnv, provName, systemPrompt, appendPrompt)
+	return newCodexSession(ctx, cliBin, cliExtraArgs, workDir, model, reasoningEffort, mode, sessionID, baseURL, extraEnv, provName, systemPrompt, appendPrompt, be, a.pool)
+}
+
+// ListNodes implements core.NodePool: the pool's backends, or nil when no
+// pool is configured.
+func (a *Agent) ListNodes() []core.NodeInfo {
+	if a.pool == nil {
+		return nil
+	}
+	out := make([]core.NodeInfo, 0, len(a.pool.Backends))
+	for _, be := range a.pool.Backends {
+		out = append(out, core.NodeInfo{
+			Name:    be.Name,
+			Host:    be.Host,
+			WorkDir: be.WorkDir,
+			Up:      be.Up.Load(),
+		})
+	}
+	return out
+}
+
+// BoundNode implements core.NodePool: the backend name bound to a session.
+func (a *Agent) BoundNode(sessionID string) string {
+	if a.pool == nil {
+		return ""
+	}
+	if be := a.pool.Bound(sessionID); be != nil {
+		return be.Name
+	}
+	return ""
+}
+
+// SelectNode implements core.NodePool: set a pending /node selection for the
+// next StartSession. Returns an error if the named backend does not exist.
+func (a *Agent) SelectNode(sessionID, name string) error {
+	if a.pool == nil {
+		return fmt.Errorf("codex: no multi-node pool configured")
+	}
+	for _, be := range a.pool.Backends {
+		if be.Name == name {
+			a.pool.SetPendingNode(sessionID, name)
+			return nil
+		}
+	}
+	return fmt.Errorf("codex: unknown node %q", name)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
