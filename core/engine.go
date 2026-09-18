@@ -9528,6 +9528,7 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/mode", action: "nav:/mode"},
 				{command: "/lang", action: "nav:/lang"},
 				{command: "/provider", action: "nav:/provider"},
+				{command: "/node", action: "nav:/node"},
 				{command: "/memory", action: "cmd:/memory"},
 				{command: "/allow", action: "cmd:/allow"},
 				{command: "/quiet", action: "cmd:/quiet"},
@@ -12160,6 +12161,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderHelpGroupCard(args)
 	case "/model":
 		return e.renderModelCard(sessionKey)
+	case "/node":
+		return e.renderNodeCard(sessionKey, args)
 	case "/reasoning":
 		return e.renderReasoningCard()
 	case "/mode":
@@ -13087,6 +13090,55 @@ func (e *Engine) renderLangCard() *Card {
 		Select(e.i18n.T(MsgLangSelectPlaceholder), opts, initVal).
 		Buttons(e.cardBackButton()).
 		Build()
+}
+
+// renderNodeCard handles /node: list backends, show the bound one, and accept
+// "/node <name>" to set a pending selection for the next session. Only agents
+// implementing core.NodePool (the claudecode multi-node pool) respond; others
+// get a "not configured" card.
+func (e *Engine) renderNodeCard(sessionKey, args string) *Card {
+	np, ok := e.agent.(NodePool)
+	if !ok {
+		return e.simpleCard("Nodes", "gray", "Multi-node pool is not configured for this bot. Add `[[projects.agent.options.hosts]]` to enable.")
+	}
+	// Resolve the agent-side session ID for affinity lookup (may be "" before
+	// the first turn — that's fine, BoundNode returns "" too).
+	_, sessions := e.sessionContextForKey(sessionKey)
+	agentSID := ""
+	if sessions != nil {
+		agentSID = sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	}
+	nodes := np.ListNodes()
+	if len(nodes) == 0 {
+		return e.simpleCard("Nodes", "gray", "No backends configured.")
+	}
+	bound := np.BoundNode(agentSID)
+	name := strings.TrimSpace(args)
+	if name != "" {
+		if err := np.SelectNode(agentSID, name); err != nil {
+			return e.simpleCard("Nodes", "red", err.Error())
+		}
+		return e.simpleCard("Nodes", "green", fmt.Sprintf("Next session will start on **%s**. Send `/new` to migrate (context from the current session stays on its box).", name))
+	}
+	var sb strings.Builder
+	sb.WriteString("| node | host | status |\n|---|---|---|\n")
+	for _, n := range nodes {
+		host := n.Host
+		if host == "" {
+			host = "local"
+		}
+		status := "✅ up"
+		if !n.Up {
+			status = "⛔ down"
+		}
+		marker := ""
+		if n.Name == bound {
+			marker = " ← current"
+		}
+		fmt.Fprintf(&sb, "| %s%s | %s | %s |\n", n.Name, marker, host, status)
+	}
+	sb.WriteString("\n`/node <name>` — route the next session to a backend.")
+	return e.simpleCard("Nodes", "blue", sb.String())
 }
 
 func (e *Engine) renderModelCard(sessionKey string) *Card {

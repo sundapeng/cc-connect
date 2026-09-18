@@ -391,6 +391,50 @@ func (a *Agent) GetReasoningEffort() string {
 	return a.reasoningEffort
 }
 
+// ListNodes implements core.NodePool. Returns the pool's backends, or nil when
+// no pool is configured.
+func (a *Agent) ListNodes() []core.NodeInfo {
+	if a.pool == nil {
+		return nil
+	}
+	out := make([]core.NodeInfo, 0, len(a.pool.backends))
+	for _, be := range a.pool.backends {
+		out = append(out, core.NodeInfo{
+			Name:    be.name,
+			Host:    be.host,
+			WorkDir: be.workDir,
+			Up:      be.up.Load(),
+		})
+	}
+	return out
+}
+
+// BoundNode implements core.NodePool: the backend name bound to a session.
+func (a *Agent) BoundNode(sessionID string) string {
+	if a.pool == nil {
+		return ""
+	}
+	if be := a.pool.bound(sessionID); be != nil {
+		return be.name
+	}
+	return ""
+}
+
+// SelectNode implements core.NodePool: set a pending /node selection for the
+// next StartSession. Returns an error if the named backend does not exist.
+func (a *Agent) SelectNode(sessionID, name string) error {
+	if a.pool == nil {
+		return fmt.Errorf("claudecode: no multi-node pool configured")
+	}
+	for _, be := range a.pool.backends {
+		if be.name == name {
+			a.pool.setPendingNode(sessionID, name)
+			return nil
+		}
+	}
+	return fmt.Errorf("claudecode: unknown node %q", name)
+}
+
 func (a *Agent) AvailableReasoningEfforts() []string {
 	return []string{"low", "medium", "high", "max"}
 }
@@ -578,21 +622,53 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	if a.pool != nil {
 		be, _ = a.pool.selectBackend(sessionID)
 	}
-	// Resolve the effective workDir/cmd for the chosen backend (a remote
-	// backend may override both). nil backend = agent defaults.
-	effectiveWorkDir := workDir
-	effectiveCmd := a.cmd
-	if be != nil {
-		if be.workDir != "" {
-			effectiveWorkDir = be.workDir
-		}
-		if be.cmd != "" {
-			effectiveCmd = be.cmd
-		}
-	}
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, effectiveWorkDir, effectiveCmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, be, a.pool)
+	// Resolve the effective workDir/cmd for the chosen backend (a remote
+	// backend may override both). nil backend = agent defaults.
+	resolve := func(be *backend) (string, string) {
+		wd, c := workDir, a.cmd
+		if be != nil {
+			if be.workDir != "" {
+				wd = be.workDir
+			}
+			if be.cmd != "" {
+				c = be.cmd
+			}
+		}
+		return wd, c
+	}
+
+	// Without a pool: single attempt, legacy behavior.
+	if a.pool == nil {
+		wd, c := resolve(nil)
+		return newClaudeSession(ctx, wd, c, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, nil, nil)
+	}
+
+	// With a pool: try the selected backend; on spawn failure mark it down
+	// and retry on another healthy backend (failover, fresh session — no
+	// --resume since the dead box holds the session file).
+	var lastErr error
+	for attempt := 0; attempt < len(a.pool.backends); attempt++ {
+		wd, c := resolve(be)
+		cs, err := newClaudeSession(ctx, wd, c, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, be, a.pool)
+		if err == nil {
+			a.pool.markUp(be)
+			return cs, nil
+		}
+		lastErr = err
+		slog.Warn("claudecode: backend spawn failed, failing over",
+			"backend", be.name, "attempt", attempt+1, "err", err)
+		a.pool.markDown(be)
+		a.pool.clearBinding(sessionID)
+		// Pick the next healthy backend. If none is healthy, selectBackend
+		// returns the first (will surface the error).
+		be, _ = a.pool.selectBackend(sessionID)
+		if be == nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("claudecode: all backends failed; last error: %w", lastErr)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {

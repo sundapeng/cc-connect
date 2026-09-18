@@ -395,6 +395,23 @@ type HistoryProvider interface {
 	GetSessionHistory(ctx context.Context, sessionID string, limit int) ([]HistoryEntry, error)
 }
 
+// NodeInfo describes one backend in a multi-node pool.
+type NodeInfo struct {
+	Name    string // reference name
+	Host    string // "" = local exec; "user@host" for SSH
+	WorkDir string
+	Up      bool // lazy health
+}
+
+// NodePool is an optional interface for agents that front a pool of backend
+// servers. The engine's /node command type-asserts the agent to this interface
+// to list/select backends.
+type NodePool interface {
+	ListNodes() []NodeInfo
+	BoundNode(sessionID string) string          // bound backend name, or "" if none
+	SelectNode(sessionID, name string) error    // set a pending /node selection
+}
+
 // ProviderConfig holds API provider settings for an agent.
 type ProviderConfig struct {
 	Name     string
