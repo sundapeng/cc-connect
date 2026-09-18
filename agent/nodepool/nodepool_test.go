@@ -3,7 +3,37 @@ package nodepool
 import (
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
+
+// TestParseBackends_FromTOML locks the real config path: a TOML array of
+// tables decodes into []map[string]any (not []any), and the old code rejected
+// exactly that shape.
+func TestParseBackends_FromTOML(t *testing.T) {
+	var doc map[string]any
+	if _, err := toml.Decode(`
+hosts = [
+  {name = "n1", host = "admin@localhost", port = 2024, work_dir = "/home/admin/ws", cmd = "/home/admin/node-tools/bin/claude"},
+  {name = "local"},
+]
+`, &doc); err != nil {
+		t.Fatalf("toml decode: %v", err)
+	}
+	got, err := ParseBackends(doc, "/root/ws", "claude")
+	if err != nil {
+		t.Fatalf("ParseBackends: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 backends, got %d", len(got))
+	}
+	if got[0].Host != "admin@localhost" || got[0].Port != 2024 || got[0].Cmd != "/home/admin/node-tools/bin/claude" {
+		t.Errorf("backend 0 wrong: %+v", got[0])
+	}
+	if got[1].Name != "local" || !got[1].IsLocal() || got[1].WorkDir != "/root/ws" {
+		t.Errorf("backend 1 defaults wrong: %+v", got[1])
+	}
+}
 
 func TestParseBackends_None(t *testing.T) {
 	got, err := ParseBackends(map[string]any{}, "/root/ws", "claude")

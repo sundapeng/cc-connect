@@ -76,14 +76,23 @@ type Pool struct {
 
 // ParseBackends reads the optional [[projects.agent.options.hosts]] array from
 // the agent opts map. Returns nil when no hosts are configured, preserving the
-// legacy single-local-process behavior.
+// legacy single-local-process behavior. Accepts both []any (map-of-any style,
+// e.g. from tests) and []map[string]any (what a TOML unmarshal produces).
 func ParseBackends(opts map[string]any, defaultWorkDir, defaultCmd string) ([]*Backend, error) {
 	raw, ok := opts["hosts"]
 	if !ok || raw == nil {
 		return nil, nil
 	}
-	arr, ok := raw.([]any)
-	if !ok {
+	var arr []any
+	switch typed := raw.(type) {
+	case []any:
+		arr = typed
+	case []map[string]any:
+		arr = make([]any, len(typed))
+		for i, m := range typed {
+			arr[i] = m
+		}
+	default:
 		return nil, fmt.Errorf("nodepool: option \"hosts\" must be an array of tables")
 	}
 	if len(arr) == 0 {
@@ -131,6 +140,8 @@ func ParseBackends(opts map[string]any, defaultWorkDir, defaultCmd string) ([]*B
 					be.SSHOpts = append(be.SSHOpts, s)
 				}
 			}
+		} else if opts, ok := m["ssh_opts"].([]string); ok {
+			be.SSHOpts = append(be.SSHOpts, opts...)
 		}
 		out = append(out, be)
 	}
