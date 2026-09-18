@@ -205,14 +205,15 @@ func TestBuildRemoteSSHArgs(t *testing.T) {
 	args := BuildRemoteSSHArgs(be, "claude", []string{"--model", "glm-5.2"}, []string{"ANTHROPIC_BASE_URL=http://x:15443", "FOO=bar baz"})
 	joined := strings.Join(args, " ")
 	// Must use BatchMode, the port, the expanded key, exec env, and quoted vars.
+	// With proper nesting, inner-quoted values appear as '\''...'\''.
 	checks := []string{
 		"-q", "-o", "BatchMode=yes", "-p", "2024",
 		"-i", strings.ReplaceAll("~/.ssh/id_rsa", "~", ""), // expanded
 		"admin@localhost", "--",
-		"sh -c", "cd \"/home/admin/ws\"", "exec env",
-		"ANTHROPIC_BASE_URL='http://x:15443'",
-		"FOO='bar baz'",
-		"'claude'", "--model", "glm-5.2",
+		"sh -c ", "cd \"/home/admin/ws\"", "exec env",
+		"ANTHROPIC_BASE_URL='\\''http://x:15443'\\''",
+		"FOO='\\''bar baz'\\''",
+		"'\\''claude'\\''", "--model", "glm-5.2",
 	}
 	for _, c := range checks {
 		if !strings.Contains(joined, c) {
@@ -224,7 +225,7 @@ func TestBuildRemoteSSHArgs(t *testing.T) {
 	if strings.Contains(joined, "exec env") {
 		t.Errorf("no extraEnv must not inject an env command: %s", joined)
 	}
-	if !strings.Contains(joined, "exec 'claude'") {
+	if !strings.Contains(joined, "exec '\\''claude'\\''") {
 		t.Errorf("expected direct exec of the binary: %s", joined)
 	}
 }
